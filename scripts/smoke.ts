@@ -74,4 +74,18 @@ await call('voicevox_render_song', {
   outputPath: `${outDir}/kirakira.wav`,
 })
 await call('voicevox_render_song', { songFile: `${outDir}/kirakira.json`, outputPath: `${outDir}/kirakira2.wav` })
+await call('voicevox_inspect_singing', { songFile: `${outDir}/kirakira.json`, track: 'lead', count: 3 })
+await call('voicevox_export_project', { songFile: `${outDir}/kirakira.json`, outputPath: `${outDir}/kirakira.vvproj` })
+await call('voicevox_import_score', { file: `${outDir}/kirakira.vvproj`, saveSongTo: `${outDir}/kirakira-imported.json` })
+await call('voicevox_render_song', { songFile: `${outDir}/kirakira-imported.json`, outputPath: `${outDir}/kirakira-imported.wav` })
+{
+  let progress = 0
+  await client.callTool(
+    { name: 'voicevox_sing', arguments: { singer: 3003, score: 'G4 E4 E4:2 R F4 D4 D4:2', lyrics: 'うさぎうさぎ', play: false, outputPath: `${outDir}/progress.wav` } },
+    undefined,
+    { onprogress: () => void progress++ }
+  )
+  console.log(`\n=== progress notifications received: ${progress}`)
+  if (progress === 0) process.exitCode = 1
+}
 await client.close()

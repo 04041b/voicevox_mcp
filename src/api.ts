@@ -116,6 +116,10 @@ export class VoicevoxApi {
     return this.request('GET', '/version', { kind: 'json' })
   }
 
+  engineManifest(): Promise<{ uuid: string; name: string; frame_rate?: number }> {
+    return this.request('GET', '/engine_manifest', { kind: 'json' })
+  }
+
   // ---- talk ----
 
   speakers(): Promise<Speaker[]> {

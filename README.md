@@ -3,10 +3,28 @@
 An MCP server that lets an AI agent use [VOICEVOX](https://voicevox.hiroshiba.jp/) for both **text-to-speech and singing**, with roughly the same control a person has in the VOICEVOX editor:
 
 - **Talk**: speak text, run multi-speaker dialogues, set the exact reading and accent (AquesTalk kana), and inspect or edit the accent phrases and mora pitch.
-- **Sing**: write melodies with lyrics in a compact score notation. Kanji lyrics are read for you. You get melisma (`ー`), per-note pitch bends, vibrato, volume and consonant timing, plus the editor's 音域調整 (key range) and 声量調整 (volume range) settings.
-- **Songs**: mix several sing tracks (lead, harmonies, duets), spoken talk tracks, a built-in synth (piano/organ/bass/…) and drum patterns into one WAV, with per-track volume and pan.
+- **Sing**: everything the VOICEVOX editor's song mode can edit.
+  - Notes and lyrics in a compact score notation. Kanji lyrics are read for you, `ー` holds a vowel, and notes without lyrics sing `ら` or their note name (`doremi`).
+  - Tempo changes and time signatures.
+  - Per-track singer and singing teacher (歌い方), 音域調整 (key range) and 声量調整 (volume range).
+  - Phoneme timing edits (音素タイミング) for any phoneme.
+  - Drawn pitch lines (ピッチ編集) and volume lines (ボリューム編集).
+  - Multiple tracks with gain, pan, mute and solo.
+  - Extras beyond the editor: per-note bends, vibrato and volume.
+- **See the result**: `voicevox_inspect_singing` is the agent's piano roll. It shows every phoneme's index and timing and how far the sung pitch line sits from each written note.
+- **Interop**: import `.vvproj`, MIDI, MusicXML, UST, USTX, SVP, VSQX, CCS and more (the same UtaFormatix converter the editor uses). Export `.vvproj` so a person can open the song in the VOICEVOX app and keep editing.
+- **Songs**: several sing tracks (lead, harmonies, duets) can be mixed with spoken talk tracks on the same timeline. A basic synth and drums are included for guide accompaniment.
 
-The singing pipeline follows the official VOICEVOX editor. Each sing track is split into phrases at rests. Each phrase is queried with the singing teacher (`sing_frame_audio_query`), its pitch is edited, its volume is re-predicted (`sing_frame_volume`) and the trailing breath is muted. The phrase is then synthesized with the chosen singer (`frame_synthesis`). Phrases are cached, so re-rendering after a small edit is fast.
+The singing pipeline is a step-by-step port of the official editor (`src/song/songTrackRendering.ts`):
+
+1. Each sing track is split into phrases at rests, with the editor's lead-in and tail lengths and phrase-boundary limits.
+2. The singing teacher predicts phoneme timing (`sing_frame_audio_query`).
+3. Phoneme timing edits are applied.
+4. Pitch is predicted (`sing_frame_f0`). Drawn pitch lines are blended in with the editor's log-domain smoothing.
+5. Volume is predicted (`sing_frame_volume`), the trailing breath is faded out, and volume edits are applied in dB.
+6. The chosen singer synthesizes the phrase (`frame_synthesis`).
+
+Phrases are cached, so re-rendering after a small edit is fast. The engine's pitch and volume predictions vary slightly from call to call (the singing model samples noise), and the cache keeps unchanged phrases identical between renders.
 
 This project was inspired by [kajidog/mcp-tts-voicevox](https://github.com/kajidog/mcp-tts-voicevox), which covers TTS but not singing.
 
@@ -20,7 +38,7 @@ This project was inspired by [kajidog/mcp-tts-voicevox](https://github.com/kajid
 ## Setup
 
 ```bash
-npm install
+npm install   # .npmrc points @jsr packages at npm.jsr.io (for the UtaFormatix converter)
 npm run build
 ```
 
@@ -58,7 +76,10 @@ Claude Desktop / Claude Code config:
 | `voicevox_speak` | TTS from `text`, `kana` or edited `accentPhrases`, or a `segments` dialogue. Supports speed, pitch, intonation, volume, pre/post silence and pause scale |
 | `voicevox_audio_query` | Show the reading/accent/pitch the engine would use and return editable `accentPhrases` |
 | `voicevox_sing` | Sing one melody |
-| `voicevox_render_song` | Render a multi-track song (sing, talk, synth and drum tracks). Can save and load the song spec as JSON |
+| `voicevox_render_song` | Render a multi-track song. Can save and load the song spec as JSON |
+| `voicevox_inspect_singing` | Per-note phonemes (index + timing) and pitch error in cents, without playing |
+| `voicevox_import_score` | `.vvproj` / MIDI / MusicXML / UST / USTX / SVP / VSQX / CCS / … → song JSON |
+| `voicevox_export_project` | Song → `.vvproj` for the VOICEVOX editor |
 | `voicevox_play` / `voicevox_stop` | Replay a file / stop playback |
 | `voicevox_dictionary_list` / `_add` / `_delete` | Manage the engine's user dictionary |
 
@@ -91,7 +112,27 @@ C4:ど:1 D4:れ:1 E4:み:2 | R:1 G4:そ:0.5 G4:ー:1.5
 - `pitchBend` is a constant offset in cents.
 - `vibrato` overrides the track's default vibrato for this note.
 - `volume` scales the singing volume curve for this note.
-- `timingOffset` moves the consonant (in seconds; negative is earlier).
+- `phonemeTimings` moves phoneme starts, like dragging phoneme boundaries in the editor. `index` is the phoneme's position in the note as shown by `voicevox_inspect_singing`; using last+1 moves the end of the final vowel before a rest. `offset` is in seconds; negative is earlier. `timingOffset` is shorthand for moving the first phoneme.
+
+### Drawn pitch and volume lines (track level)
+
+```json
+{ "pitchCurves": [{ "points": [[7.5, "C5"], [8, "G4"]] }],
+  "volumeCurves": [{ "points": [[0, -6], [4, 3]] }] }
+```
+
+- Points are `[beat, value]` and are joined by straight lines.
+- Pitch values can be a note name (`"A4"`), a note with a cents offset (`"A4+30c"`), a fractional MIDI number, or `{ "hz": 440 }`. Pitch lines are absolute and are blended into the predicted pitch with the editor's smoothing.
+- Volume values are dB relative to the predicted volume.
+- Projects imported from the editor keep its raw per-frame data in `pitchEditData` and `volumeEditData`.
+
+### Working with the VOICEVOX editor
+
+- `voicevox_import_score { file: "song.mid" }` writes `song.song.json`. Pick singers and lyrics, then render with `voicevox_render_song { songFile }`.
+- `voicevox_export_project { songFile, outputPath: "song.vvproj" }` writes a project the VOICEVOX app can open.
+  - Notes, lyrics, tempo, time signatures, singer and teacher, range adjustments, phoneme timings, pitch and volume lines, and gain/pan/mute/solo carry over.
+  - Note bends, vibrato and note volume have no editor equivalent, so their result is baked into the pitch and volume lines.
+  - Talk, synth and drum tracks are left out, with a warning.
 
 ## Example: a full song
 
@@ -124,6 +165,8 @@ To iterate, edit `songs/kirakira.json` and call `voicevox_render_song` with `{ "
 ```bash
 npm test                    # unit tests (no engine needed)
 npm run typecheck
-npx tsx scripts/smoke.ts    # end-to-end via MCP against a running engine
+npx tsx scripts/smoke.ts            # end-to-end via MCP against a running engine
+npx tsx scripts/verify-singing.ts   # measures pitch/timing/volume edits on the real engine
+npx tsx scripts/verify-project.ts   # .vvproj round trip and MIDI import
 npx tsx scripts/expression.ts
 ```

@@ -23,9 +23,11 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "@sevenc-nanashi/utaformatix-ts": "npm:@jsr/sevenc-nanashi__utaformatix-ts@^0.4.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@tonejs/midi": "^2.0.28",
     "@types/node": "^26.6.5",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",

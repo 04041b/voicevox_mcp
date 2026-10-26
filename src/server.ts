@@ -1,12 +1,15 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js'
+import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js'
 import * as z from 'zod'
 import { type AccentPhrase, VoicevoxApi } from './api.js'
 import type { Config } from './config.js'
 import { playFile, stopPlayback } from './playback.js'
 import { getSingers } from './singers.js'
+import { importScoreFile, songToVvproj, vvprojToSong } from './project.js'
+import { inspectSingTrack, singDetail } from './sing.js'
 import { renderSong, type Song } from './song.js'
 import { buildAudioQuery, summarizeQuery, synthesizeQuery } from './tts.js'
 import { decodeWav, durationSec, encodeWav, Mixer } from './wav.js'
@@ -61,6 +64,7 @@ const vibratoSchema = z.union([
 ])
 
 const noteSchema = z.object({
+  id: z.string().optional().describe('Stable note id (kept through .vvproj import/export).'),
   pitch: z
     .union([z.string(), z.number(), z.null()])
     .optional()
@@ -71,7 +75,11 @@ const noteSchema = z.object({
   pitchBend: z.number().optional().describe('Constant pitch offset in cents (sing).'),
   bend: z.array(z.tuple([z.number(), z.number()])).optional().describe('Pitch curve [[pos 0..1, cents], ...] (sing). e.g. scoop: [[0,-100],[0.15,0]]'),
   vibrato: vibratoSchema.optional(),
-  timingOffset: z.number().optional().describe('Seconds to move this note\'s consonant start (negative = earlier) (sing).'),
+  phonemeTimings: z
+    .array(z.object({ index: z.number().int().min(0), offset: z.number() }))
+    .optional()
+    .describe('Move phoneme starts (editor 音素タイミング): index = phoneme index in this note as shown by voicevox_inspect_singing (0 = first; last+1 = the end of the final vowel before a rest), offset in seconds (negative = earlier).'),
+  timingOffset: z.number().optional().describe('Shorthand for phonemeTimings [{index:0, offset}] (moves the consonant).'),
 })
 
 const trackBase = {
@@ -79,6 +87,7 @@ const trackBase = {
   volume: z.number().optional().describe('Linear gain, default 1'),
   pan: z.number().min(-1).max(1).optional().describe('-1 left .. 1 right'),
   mute: z.boolean().optional(),
+  solo: z.boolean().optional().describe('If any track is solo, only solo tracks play'),
   startBeat: z.number().optional().describe('Beat where this track starts, default 0'),
 }
 
@@ -100,10 +109,34 @@ const singTrackFields = {
     .string()
     .optional()
     .describe('Lyrics assigned one mora per note to notes without a lyric. Kana or kanji text (kanji is read by the engine).'),
-  defaultLyric: z.string().optional().describe('Lyric for notes that still have none, default "ら".'),
+  defaultLyric: z.string().optional().describe('Lyric for notes that still have none: kana, or "doremi" to sing note names. Default "ら".'),
   keyRangeAdjustment: z.number().int().optional().describe('Editor "音域調整" in semitones. Default is the editor\'s value for the voice.'),
   volumeRangeAdjustment: z.number().optional().describe('Editor "声量調整" in dB.'),
   vibrato: vibratoSchema.optional().describe('Default vibrato for all notes (off unless set).'),
+  pitchCurves: z
+    .array(
+      z.object({
+        points: z.array(
+          z.tuple([z.number(), z.union([z.string(), z.number(), z.object({ hz: z.number().positive() })])])
+        ),
+      })
+    )
+    .optional()
+    .describe(
+      'Drawn pitch lines (editor ピッチ編集), absolute pitch: points [beat, pitch] with pitch "A4", "A4+30c", fractional MIDI 69.3 or {hz}. Linear between points; blended into the predicted pitch with the editor\'s smoothing. e.g. a fall at the end of a phrase: [[7.5,"C5"],[8,"G4"]]'
+    ),
+  volumeCurves: z
+    .array(z.object({ points: z.array(z.tuple([z.number(), z.number()])) }))
+    .optional()
+    .describe('Drawn volume lines (editor ボリューム編集): points [beat, dB relative to the predicted volume]. e.g. crescendo [[0,-6],[4,3]]'),
+  pitchEditData: z
+    .array(z.number())
+    .optional()
+    .describe('Raw editor pitch data (Hz per 1/93.75 s frame from song start, -1 = none). Normally set by project import.'),
+  volumeEditData: z
+    .array(z.number().nullable())
+    .optional()
+    .describe('Raw editor volume data (dB per frame, null = none). Normally set by project import.'),
 }
 
 const singTrackSchema = z.object({ type: z.literal('sing'), ...singTrackFields })
@@ -149,6 +182,10 @@ const songSchema = z.object({
   title: z.string().optional(),
   bpm: z.number().positive().optional().describe('Default 120'),
   tempo: z.array(z.object({ beat: z.number(), bpm: z.number().positive() })).optional().describe('Tempo changes'),
+  timeSignatures: z
+    .array(z.object({ bar: z.number().int().min(1), beats: z.number().int(), beatType: z.number().int() }))
+    .optional()
+    .describe('Time signatures (for .vvproj export). Default 4/4.'),
   tracks: z.array(trackSchema),
   masterGain: z.number().optional(),
   normalize: z.boolean().optional(),
@@ -156,6 +193,8 @@ const songSchema = z.object({
 })
 
 // ---------------------------------------------------------------- helpers
+
+type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>
 
 function text(data: unknown): CallToolResult {
   return { content: [{ type: 'text', text: typeof data === 'string' ? data : JSON.stringify(data, null, 2) }] }
@@ -183,7 +222,8 @@ export function createServer(config: Config): McpServer {
     {
       instructions:
         'VOICEVOX text-to-speech and singing. Speak with voicevox_speak. Sing with voicevox_sing (one melody) or ' +
-        'voicevox_render_song (multi-track: several singers, harmonies, spoken parts, built-in synth/drum backing). ' +
+        'voicevox_render_song (multi-track songs). Check results with voicevox_inspect_singing; import MIDI/MusicXML/UST/.vvproj ' +
+        'with voicevox_import_score and hand songs to the VOICEVOX editor with voicevox_export_project. ' +
         'Talk speakers and singers use different style ids: get them from voicevox_list_speakers / voicevox_list_singers.',
     }
   )
@@ -338,6 +378,39 @@ export function createServer(config: Config): McpServer {
 
   // ---- sing
 
+  /** Forward render progress as MCP progress notifications when the client asked for them. */
+  function progressLogger(extra: ToolExtra) {
+    const token = extra._meta?.progressToken
+    if (token === undefined) return undefined
+    let n = 0
+    return (message: string) => {
+      n++
+      extra.sendNotification({ method: 'notifications/progress', params: { progressToken: token, progress: n, message } }).catch(() => {})
+    }
+  }
+
+  const ctxFor = (extra: ToolExtra) => ({ api, defaultTalkSpeaker: config.defaultSpeaker, log: progressLogger(extra) })
+
+  async function loadSong(song: unknown, songFile: string | undefined): Promise<Song> {
+    let spec = song as Song | undefined
+    if (!spec && songFile) spec = songSchema.parse(JSON.parse(await readFile(songFile, 'utf8'))) as Song
+    if (!spec) throw new Error('Provide song or songFile')
+    for (const t of spec.tracks) if (t.type === 'sing' && t.singer === undefined) t.singer = config.defaultSinger
+    return spec
+  }
+
+  async function saveJson(file: string, data: unknown) {
+    const full = path.resolve(file)
+    await mkdir(path.dirname(full), { recursive: true })
+    await writeFile(full, JSON.stringify(data, null, 2))
+    return full
+  }
+
+  const songSource = {
+    song: songSchema.optional().describe('The song spec. Either this or songFile.'),
+    songFile: z.string().optional().describe('Path to a JSON song spec (as saved by saveSongTo / voicevox_import_score).'),
+  }
+
   server.registerTool(
     'voicevox_sing',
     {
@@ -349,19 +422,22 @@ export function createServer(config: Config): McpServer {
         '  or score "C4 D4 E4 F4 E4 D4 C4:2" with lyrics "かえるのうたが".',
         'One mora per note (きゃ, っ, ん each count as one). "ー" holds the previous vowel across notes (melisma).',
         'Pitch: C4 = middle C (MIDI 60). Comfortable ranges: female/child voices ~ A3–A5, male voices ~ C3–C5.',
-        'Expression per note: volume, pitchBend (cents), bend curve, vibrato, timingOffset. For harmonies, backing or spoken parts use voicevox_render_song.',
+        'Everything the VOICEVOX editor can edit is available: per-note volume, bend, vibrato and phonemeTimings; drawn pitchCurves / volumeCurves; keyRangeAdjustment (音域調整) and volumeRangeAdjustment (声量調整).',
+        'Use voicevox_inspect_singing to see phoneme timings and how the pitch sits on each note. For several tracks use voicevox_render_song.',
       ].join('\n'),
       inputSchema: {
         ...singTrackFields,
         bpm: z.number().positive().optional().describe('Tempo, default 120'),
+        tempo: songSchema.shape.tempo,
         ...outputFields,
       },
     },
-    async (args) => {
-      const { bpm, outputPath, play, waitForEnd, returnAudio, ...track } = args
+    async (args, extra) => {
+      const { bpm, tempo, outputPath, play, waitForEnd, returnAudio, ...track } = args
       return renderAndDeliver(
-        { bpm, tracks: [{ type: 'sing', ...track, singer: track.singer ?? config.defaultSinger }] },
-        { outputPath, play, waitForEnd, returnAudio }
+        { bpm, tempo, tracks: [{ type: 'sing', ...track, singer: track.singer ?? config.defaultSinger }] },
+        { outputPath, play, waitForEnd, returnAudio },
+        extra
       )
     }
   )
@@ -371,32 +447,26 @@ export function createServer(config: Config): McpServer {
     {
       title: 'Render song',
       description: [
-        'Render a full multi-track song to one WAV: any number of sing tracks (lead, harmonies, duets), talk tracks (spoken lines, narration, rap-like parts placed on beats), synth tracks (piano/organ/bass/... melodies and chords) and drum patterns, all on a shared tempo grid with volume/pan per track.',
+        'Render a multi-track song to one WAV, like the VOICEVOX editor\'s song mode: several sing tracks (lead, harmonies, duets), each with its own singer, volume, pan, mute/solo.',
         'Track types:',
-        '  sing  {type:"sing", singer, score|notes, lyrics?, transpose?, vibrato?, volume?, pan?, startBeat?}',
-        '  talk  {type:"talk", speaker?, segments:[{text|kana, beat?|atSeconds?, speedScale?, ...}]}',
-        '  synth {type:"synth", waveform:"piano"|"organ"|"bass"|"sine"|"square"|"sawtooth"|"triangle", score|notes (chords "C4+E4+G4:4"), repeat?}',
-        '  drums {type:"drums", pattern:"k-h-s-h-", stepBeats?:0.5, repeat?}',
-        'Score notation is the same as voicevox_sing. Tracks start at beat 0 unless startBeat is set. Rests split sung phrases (also good places to breathe).',
-        'Iterate like a producer: save the spec with saveSongTo, edit, then re-render from songFile. Unchanged phrases are cached, so re-renders are fast.',
+        '  sing  {type:"sing", singer, score|notes, lyrics?, transpose?, vibrato?, pitchCurves?, volumeCurves?, volume?, pan?, startBeat?}',
+        '  talk  {type:"talk", speaker?, segments:[{text|kana, beat?|atSeconds?, speedScale?, ...}]}  (spoken lines on the timeline)',
+        '  synth {type:"synth", waveform:"piano"|..., score|notes} and drums {type:"drums", pattern:"k-h-s-h-"} (simple guide accompaniment)',
+        'Score notation is the same as voicevox_sing. Tracks start at beat 0 unless startBeat is set. Rests split sung phrases (also where the singer breathes).',
+        'Iterate like in the editor: save the spec with saveSongTo, inspect with voicevox_inspect_singing, edit, re-render from songFile. Unchanged phrases are cached.',
+        'Import MIDI/MusicXML/UST/.vvproj with voicevox_import_score; open the result in the VOICEVOX editor with voicevox_export_project.',
       ].join('\n'),
       inputSchema: {
-        song: songSchema.optional().describe('The song spec. Either this or songFile.'),
-        songFile: z.string().optional().describe('Path to a JSON song spec (as saved by saveSongTo).'),
+        ...songSource,
         saveSongTo: z.string().optional().describe('Also save the song spec JSON here for later editing.'),
         ...outputFields,
       },
     },
-    async ({ song, songFile, saveSongTo, ...out }) => {
+    async ({ song, songFile, saveSongTo, ...out }, extra) => {
       try {
-        let spec = song as Song | undefined
-        if (!spec && songFile) spec = songSchema.parse(JSON.parse(await readFile(songFile, 'utf8'))) as Song
-        if (!spec) throw new Error('Provide song or songFile')
-        if (saveSongTo) {
-          await mkdir(path.dirname(path.resolve(saveSongTo)), { recursive: true })
-          await writeFile(saveSongTo, JSON.stringify(spec, null, 2))
-        }
-        return await renderAndDeliver(spec, out, saveSongTo ? { songFile: path.resolve(saveSongTo) } : {})
+        const spec = await loadSong(song, songFile)
+        const saved = saveSongTo ? await saveJson(saveSongTo, spec) : undefined
+        return await renderAndDeliver(spec, out, extra, saved ? { songFile: saved } : {})
       } catch (e) {
         return fail(e)
       }
@@ -406,20 +476,143 @@ export function createServer(config: Config): McpServer {
   async function renderAndDeliver(
     song: Song,
     out: { outputPath?: string; play?: boolean; waitForEnd?: boolean; returnAudio?: boolean },
-    extra: Record<string, unknown> = {}
+    extra: ToolExtra,
+    info: Record<string, unknown> = {}
   ): Promise<CallToolResult> {
     try {
-      for (const t of song.tracks) if (t.type === 'sing' && t.singer === undefined) t.singer = config.defaultSinger
-      const result = await renderSong({ api, defaultTalkSpeaker: config.defaultSpeaker }, song)
+      const result = await renderSong(ctxFor(extra), song)
       return await deliver(encodeWav(result.audio), song.title ?? 'song', out, {
         duration: result.duration,
         tracks: result.tracks,
-        ...extra,
+        ...info,
       })
     } catch (e) {
       return fail(e)
     }
   }
+
+  server.registerTool(
+    'voicevox_inspect_singing',
+    {
+      title: 'Inspect singing',
+      description: [
+        'Show what the singer will actually do, like looking at the VOICEVOX editor\'s piano roll: for each note its lyric, start/end, every phoneme with its index and timing, and how far the sung pitch line sits from the written note (cents).',
+        'Use the phoneme indices with a note\'s phonemeTimings to move consonants/vowels, and pitchErrorCents to decide on pitchCurves or bends. Renders (cached) but does not play.',
+      ].join('\n'),
+      inputSchema: {
+        ...songSource,
+        track: z.union([z.number().int(), z.string()]).optional().describe('Track index (0-based) or name. Default: first sing track.'),
+        fromNote: z.number().int().min(1).optional().describe('First note number (1-based, rests count) to show. Default 1.'),
+        count: z.number().int().min(1).max(200).optional().describe('How many notes to show. Default 40.'),
+      },
+    },
+    async ({ song, songFile, track, fromNote, count }, extra) => {
+      try {
+        const spec = await loadSong(song, songFile)
+        const index =
+          track === undefined
+            ? spec.tracks.findIndex((t) => t.type === 'sing')
+            : typeof track === 'number'
+              ? track
+              : spec.tracks.findIndex((t) => t.name === track)
+        const t = spec.tracks[index]
+        if (!t || t.type !== 'sing') throw new Error(`No sing track ${track ?? ''} in the song`)
+        const result = await renderSong(ctxFor(extra), { ...spec, tracks: spec.tracks.map((x, i) => (i === index ? { ...x, mute: false, solo: false } : x)) }, { onlyTracks: [index] })
+        const res = result.sing.get(index)
+        if (!res) throw new Error('Track did not render')
+        const all = inspectSingTrack(res)
+        const from = fromNote ?? 1
+        const shown = all.filter((n) => n.note >= from).slice(0, count ?? 40)
+        return text({
+          track: index,
+          ...singDetail(res),
+          phraseStarts: res.phrases.map((p) => Number(p.start.toFixed(3))),
+          notesShown: `${shown.length} of ${all.length}`,
+          phonemeFormat: 'index:phoneme start-end (song seconds)',
+          notes: shown.map((n) => ({
+            ...n,
+            phonemes: n.phonemes.map((p) => `${p.index}:${p.phoneme} ${p.start.toFixed(3)}-${p.end.toFixed(3)}`).join(', '),
+          })),
+        })
+      } catch (e) {
+        return fail(e)
+      }
+    }
+  )
+
+  server.registerTool(
+    'voicevox_export_project',
+    {
+      title: 'Export VOICEVOX project',
+      description:
+        'Save the song as a VOICEVOX editor project (.vvproj) so a person can open it in the VOICEVOX app and keep editing: notes, lyrics, tempo, time signatures, singer & singing teacher, 音域調整/声量調整, phoneme timing, pitch and volume edits, track gain/pan/mute/solo. Talk/synth/drum tracks are not part of .vvproj and are left out.',
+      inputSchema: {
+        ...songSource,
+        outputPath: z.string().describe('Where to write the .vvproj file'),
+      },
+    },
+    async ({ song, songFile, outputPath }, extra) => {
+      try {
+        const spec = await loadSong(song, songFile)
+        const singIdx = spec.tracks.flatMap((t, i) => (t.type === 'sing' ? [i] : []))
+        // Render every sing track (even muted ones) so note-relative edits can be baked in.
+        const unmuted = { ...spec, tracks: spec.tracks.map((t) => ({ ...t, mute: false, solo: false })) }
+        const result = await renderSong(ctxFor(extra), unmuted, { onlyTracks: singIdx })
+        const manifest = await api.engineManifest().catch(() => undefined)
+        const { project, warnings } = songToVvproj(spec, result, manifest?.uuid)
+        const file = await saveJson(outputPath.endsWith('.vvproj') ? outputPath : `${outputPath}.vvproj`, project)
+        return text({ file, tracks: project.song.trackOrder.length, warnings })
+      } catch (e) {
+        return fail(e)
+      }
+    }
+  )
+
+  server.registerTool(
+    'voicevox_import_score',
+    {
+      title: 'Import score / project',
+      description:
+        'Load a song from a file into an editable song spec: VOICEVOX projects (.vvproj, including pitch/volume/timing edits) and, via UtaFormatix like the VOICEVOX editor, MIDI (.mid), MusicXML (.musicxml/.xml), UTAU (.ust), OpenUtau (.ustx), Synthesizer V (.svp/.s5p), VOCALOID (.vsqx/.vpr/.vsq), CeVIO (.ccs), DeepVocal (.dv), VoiSona (.tssln), Piapro Studio (.ppsf) and .ufdata. Lyrics are converted to kana. The spec is saved as JSON for voicevox_render_song / voicevox_inspect_singing.',
+      inputSchema: {
+        file: z.string().describe('Path of the file to import'),
+        singer: z.number().int().optional().describe('Singer for tracks that have none (default VOICEVOX_DEFAULT_SINGER).'),
+        saveSongTo: z.string().optional().describe('Where to save the song JSON. Default: next to the input as <name>.song.json'),
+      },
+    },
+    async ({ file, singer, saveSongTo }) => {
+      try {
+        const data = await readFile(file)
+        const defaultSinger = singer ?? config.defaultSinger
+        const { song, warnings } = file.toLowerCase().endsWith('.vvproj')
+          ? vvprojToSong(JSON.parse(data.toString('utf8')), defaultSinger, path.parse(file).name)
+          : await importScoreFile(data, file, defaultSinger)
+        if (singer !== undefined) for (const t of song.tracks) if (t.type === 'sing') t.singer = singer
+        const out = await saveJson(saveSongTo ?? path.join(path.dirname(file), `${path.parse(file).name}.song.json`), song)
+        return text({
+          songFile: out,
+          title: song.title,
+          bpm: song.bpm,
+          tempoChanges: song.tempo?.length ?? 0,
+          tracks: song.tracks.map((t, i) => ({
+            index: i,
+            name: t.name,
+            ...(t.type === 'sing'
+              ? {
+                  singer: t.singer,
+                  notes: t.notes?.filter((n) => n.pitch !== null).length,
+                  lyrics: t.notes?.map((n) => n.lyric ?? (n.pitch === null ? ' ' : '?')).join('').trim().slice(0, 120),
+                }
+              : {}),
+          })),
+          warnings,
+          next: 'Render with voicevox_render_song {songFile}. Edit the JSON to change singers, lyrics or expression.',
+        })
+      } catch (e) {
+        return fail(e)
+      }
+    }
+  )
 
   // ---- playback
 
