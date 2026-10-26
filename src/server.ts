@@ -110,8 +110,8 @@ const singTrackFields = {
     .optional()
     .describe('Lyrics assigned one mora per note to notes without a lyric. Kana or kanji text (kanji is read by the engine).'),
   defaultLyric: z.string().optional().describe('Lyric for notes that still have none: kana, or "doremi" to sing note names. Default "ら".'),
-  keyRangeAdjustment: z.number().int().optional().describe('Editor "音域調整" in semitones. Default is the editor\'s value for the voice.'),
-  volumeRangeAdjustment: z.number().optional().describe('Editor "声量調整" in dB.'),
+  keyRangeAdjustment: z.number().int().optional().describe('Editor "音域調整" in semitones (editor range -28..28). Default is the editor\'s value for the voice.'),
+  volumeRangeAdjustment: z.number().optional().describe('Editor "声量調整" in dB (the editor allows whole numbers -20..20).'),
   vibrato: vibratoSchema.optional().describe('Default vibrato for all notes (off unless set).'),
   pitchCurves: z
     .array(
@@ -576,7 +576,7 @@ export function createServer(config: Config): McpServer {
         'Load a song from a file into an editable song spec: VOICEVOX projects (.vvproj, including pitch/volume/timing edits) and, via UtaFormatix like the VOICEVOX editor, MIDI (.mid), MusicXML (.musicxml/.xml), UTAU (.ust), OpenUtau (.ustx), Synthesizer V (.svp/.s5p), VOCALOID (.vsqx/.vpr/.vsq), CeVIO (.ccs), DeepVocal (.dv), VoiSona (.tssln), Piapro Studio (.ppsf) and .ufdata. Lyrics are converted to kana. The spec is saved as JSON for voicevox_render_song / voicevox_inspect_singing.',
       inputSchema: {
         file: z.string().describe('Path of the file to import'),
-        singer: z.number().int().optional().describe('Singer for tracks that have none (default VOICEVOX_DEFAULT_SINGER).'),
+        singer: z.number().int().optional().describe('Singer for tracks that do not name one (MIDI, MusicXML, ... never do; .vvproj tracks keep theirs). Default VOICEVOX_DEFAULT_SINGER. Change singers afterwards by editing the saved JSON.'),
         saveSongTo: z.string().optional().describe('Where to save the song JSON. Default: next to the input as <name>.song.json'),
       },
     },
@@ -587,7 +587,6 @@ export function createServer(config: Config): McpServer {
         const { song, warnings } = file.toLowerCase().endsWith('.vvproj')
           ? vvprojToSong(JSON.parse(data.toString('utf8')), defaultSinger, path.parse(file).name)
           : await importScoreFile(data, file, defaultSinger)
-        if (singer !== undefined) for (const t of song.tracks) if (t.type === 'sing') t.singer = singer
         const out = await saveJson(saveSongTo ?? path.join(path.dirname(file), `${path.parse(file).name}.song.json`), song)
         return text({
           songFile: out,

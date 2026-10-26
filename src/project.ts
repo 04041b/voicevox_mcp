@@ -89,7 +89,7 @@ export function songToVvproj(song: Song, result: RenderResult, engineId = DEFAUL
     song: {
       tpqn: TPQN,
       tempos,
-      timeSignatures: (song.timeSignatures?.length ? song.timeSignatures : [{ bar: 1, beats: 4, beatType: 4 }]).map((t) => ({
+      timeSignatures: withFirstBar(song.timeSignatures).map((t) => ({
         measureNumber: t.bar,
         beats: t.beats,
         beatType: t.beatType,
@@ -98,7 +98,59 @@ export function songToVvproj(song: Song, result: RenderResult, engineId = DEFAUL
       trackOrder: order,
     },
   }
+  const errors = validateVvproj(project)
+  if (errors.length) throw new Error(`The song can't be represented as a VOICEVOX project: ${errors.join('; ')}`)
   return { project, warnings }
+}
+
+function withFirstBar(ts: TimeSignature[] | undefined): TimeSignature[] {
+  const sorted = [...(ts ?? [])].sort((a, b) => a.bar - b.bar)
+  if (sorted[0]?.bar !== 1) sorted.unshift({ bar: 1, beats: 4, beatType: 4 })
+  return sorted
+}
+
+// Editor limits (src/song/domain.ts, src/song/music.ts)
+const KEY_RANGE = [-28, 28] as const
+const VOLUME_RANGE = [-20, 20] as const
+const MIN_BPM = 40
+const BEAT_TYPES = [2, 4, 8, 16, 32]
+
+/** The checks the editor runs when it loads a song (isValidTpqn / Tempos / TimeSignatures / Track). */
+export function validateVvproj(p: VvProject): string[] {
+  const e: string[] = []
+  const s = p.song
+  const int = Number.isInteger
+  if (!(int(s.tpqn) && BEAT_TYPES.every((b) => (s.tpqn * 4) % b === 0) && s.tpqn % 3 === 0)) e.push(`invalid tpqn ${s.tpqn}`)
+  if (!s.tempos.length || s.tempos[0].position !== 0) e.push('first tempo must be at position 0')
+  for (const t of s.tempos) {
+    if (!int(t.position) || t.position < 0 || !Number.isFinite(t.bpm) || t.bpm < MIN_BPM) e.push(`tempo ${t.bpm} BPM at tick ${t.position} (editor minimum is ${MIN_BPM} BPM)`)
+  }
+  if (!s.timeSignatures.length || s.timeSignatures[0].measureNumber !== 1) e.push('first time signature must be at bar 1')
+  for (const t of s.timeSignatures) {
+    if (!int(t.measureNumber) || t.measureNumber < 1 || !int(t.beats) || t.beats < 1 || !BEAT_TYPES.includes(t.beatType)) {
+      e.push(`time signature ${t.beats}/${t.beatType} at bar ${t.measureNumber} (beat type must be one of ${BEAT_TYPES.join(', ')})`)
+    }
+  }
+  for (const [id, t] of Object.entries(s.tracks)) {
+    const name = t.name || id
+    if (!int(t.keyRangeAdjustment) || t.keyRangeAdjustment < KEY_RANGE[0] || t.keyRangeAdjustment > KEY_RANGE[1]) e.push(`${name}: keyRangeAdjustment ${t.keyRangeAdjustment}`)
+    if (!int(t.volumeRangeAdjustment) || t.volumeRangeAdjustment < VOLUME_RANGE[0] || t.volumeRangeAdjustment > VOLUME_RANGE[1]) e.push(`${name}: volumeRangeAdjustment ${t.volumeRangeAdjustment}`)
+    for (const n of t.notes) {
+      if (!int(n.position) || !int(n.duration) || !int(n.noteNumber) || n.position < 0 || n.duration < 1 || n.noteNumber < 0 || n.noteNumber > 127) {
+        e.push(`${name}: note at tick ${n.position} (pitch ${n.noteNumber}, length ${n.duration})`)
+        break
+      }
+    }
+    if (!t.pitchEditData.every((v) => Number.isFinite(v) && (v > 0 || v === VALUE_INDICATING_NO_DATA))) e.push(`${name}: pitch edit data`)
+    if (!t.volumeEditData.every((v) => v === null || (Number.isFinite(v) && Number.isFinite(10 ** (v / 20))))) e.push(`${name}: volume edit data`)
+  }
+  return e
+}
+
+function clampInt(v: number, [lo, hi]: readonly [number, number], label: string, warnings: string[]): number {
+  const c = Math.min(hi, Math.max(lo, Math.round(v)))
+  if (c !== v) warnings.push(`${label} ${v} is outside the editor's range (${lo}..${hi} whole numbers); exported as ${c}, so the editor's render will differ.`)
+  return c
 }
 
 function singTrackToVv(
@@ -185,8 +237,8 @@ function singTrackToVv(
     name: track.name ?? `${res.singer.singerName}`,
     singer: { engineId, styleId: track.singer },
     singingTeacher: { styleId: res.teacher },
-    keyRangeAdjustment: res.keyRangeAdjustment,
-    volumeRangeAdjustment: track.volumeRangeAdjustment ?? 0,
+    keyRangeAdjustment: clampInt(res.keyRangeAdjustment, KEY_RANGE, `Track ${index + 1} keyRangeAdjustment`, warnings),
+    volumeRangeAdjustment: clampInt(track.volumeRangeAdjustment ?? 0, VOLUME_RANGE, `Track ${index + 1} volumeRangeAdjustment`, warnings),
     notes,
     pitchEditData: trimTrailing(pitch, (v) => v === VALUE_INDICATING_NO_DATA),
     volumeEditData: trimTrailing(volume, (v) => v === null),

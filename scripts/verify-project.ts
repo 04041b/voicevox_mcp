@@ -2,7 +2,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import midiPkg from '@tonejs/midi'
 import { VoicevoxApi } from '../src/api.js'
-import { importScoreFile, songToVvproj, vvprojToSong } from '../src/project.js'
+import { importScoreFile, songToVvproj, validateVvproj, vvprojToSong } from '../src/project.js'
 import { inspectSingTrack } from '../src/sing.js'
 import { renderSong, type SingTrack, type Song } from '../src/song.js'
 
@@ -37,7 +37,7 @@ const song: Song = {
         { pitch: 'A4', lyric: 'ほ', beats: 2, volume: 0.6 },
         { pitch: 'G4', lyric: 'し', beats: 3, timingOffset: -0.05 },
       ],
-      pitchCurves: [{ points: [[9, 'G4'], [10, 'F4']] }],
+      pitchCurves: [{ points: [[7, 'G4'], [8, 'F4']] }], // inside し (beats 6-9)
       volumeCurves: [{ points: [[6, 0], [8, -4]] }],
     },
     { type: 'drums', pattern: 'k-s-' },
@@ -68,11 +68,27 @@ const a = inspectSingTrack(result.sing.get(0)!)
 const b = inspectSingTrack(r2.sing.get(0)!)
 const phon = (x: typeof a) => x.flatMap((n) => n.phonemes.map((p) => `${p.phoneme}@${p.start.toFixed(2)}`)).join(' ')
 check('re-imported song has identical phoneme timings', phon(a) === phon(b), { a: phon(a), b: phon(b) })
-const f0a = result.sing.get(0)!.phrases[1].query.f0
-const f0b = r2.sing.get(0)!.phrases[1].query.f0
-const frames = [...result.sing.get(0)!.phrases[1].relPitchFrames]
-const maxCents = Math.max(0, ...frames.map((f) => Math.abs(1200 * Math.log2(f0b[f] / f0a[f]))).filter(Number.isFinite))
-check('baked pitch edits reproduce the edited pitch (< 5 cents)', maxCents < 5, { maxCents: maxCents.toFixed(2) })
+// vibrato on ら (phrase 0) was baked into pitchEditData: the re-import must sing the same pitch there
+const f0a = result.sing.get(0)!.phrases[0].query.f0
+const f0b = r2.sing.get(0)!.phrases[0].query.f0
+const frames = [...result.sing.get(0)!.phrases[0].relPitchFrames].filter((f) => f0a[f] > 0 && f0b[f] > 0)
+const cents = frames.map((f) => Math.abs(1200 * Math.log2(f0b[f] / f0a[f])))
+const sorted = [...cents].sort((x, y) => x - y)
+check('baked vibrato frames exist', frames.length > 20, frames.length)
+check('baked vibrato reproduces on re-import (median < 3 cents)', sorted[Math.floor(sorted.length / 2)] < 3, {
+  median: sorted[Math.floor(sorted.length / 2)]?.toFixed(2),
+  max: sorted[sorted.length - 1]?.toFixed(2),
+})
+// the drawn pitch line at beat 7.5 is halfway G4->F4 = F#4 in both renders
+const ph1a = result.sing.get(0)!.phrases[1]
+const ph1b = r2.sing.get(0)!.phrases[1]
+const at = (p: typeof ph1a) => p.query.f0[Math.round(result.tempo.beatToSec(7.5) * 93.75) - Math.round(p.start * 93.75)]
+const target = 440 * 2 ** ((66 - 69) / 12)
+check('pitch line holds F#4 at beat 7.5 (original and re-import)', Math.abs(1200 * Math.log2(at(ph1a) / target)) < 5 && Math.abs(1200 * Math.log2(at(ph1b) / target)) < 5, {
+  original: at(ph1a).toFixed(2),
+  reimported: at(ph1b).toFixed(2),
+  target: target.toFixed(2),
+})
 
 // MIDI import
 const midi = new Midi()
@@ -88,6 +104,47 @@ check('MIDI import: tempo', Math.round(mid.song.bpm ?? 0) === 90, mid.song.bpm)
 check('MIDI import: notes and gap rest', mt.notes!.map((n) => `${n.pitch}:${n.beats}`).join(' ') === '60:1 62:1 64:1 :1 65:1 67:1'.replace(':1 65', 'null:1 65'), mt.notes!.map((n) => `${n.pitch}:${n.beats}`).join(' '))
 const rm = await renderSong(ctx, mid.song)
 check('MIDI import renders', rm.duration > 5, rm.duration)
+
+// MusicXML and UST: generate fixtures with UtaFormatix itself, with lyrics, and import them back
+const { Project } = await import('@sevenc-nanashi/utaformatix-ts')
+const uf = new Project({
+  formatVersion: 1,
+  project: {
+    name: 'fixture',
+    measurePrefix: 0,
+    tempos: [{ tickPosition: 0, bpm: 110 }],
+    timeSignatures: [{ measurePosition: 0, numerator: 4, denominator: 4 }],
+    tracks: [{ name: 'v', notes: ['か', 'え', 'る', 'の'].map((lyric, i) => ({ key: 60 + i * 2, tickOn: i * 480, tickOff: i * 480 + 480, lyric })) }],
+  },
+})
+for (const [ext, gen] of [
+  ['musicxml', () => uf.toMusicXml()],
+  ['ust', () => uf.toUst()],
+] as const) {
+  const [bytes] = await gen()
+  const imp = await importScoreFile(bytes, `fixture.${ext}`, 3003)
+  const it = imp.song.tracks[0] as SingTrack
+  const desc = it.notes!.map((n) => `${n.pitch}:${n.lyric}`).join(' ')
+  check(`${ext} import keeps pitches and lyrics`, desc === '60:か 62:え 64:る 66:の' && Math.round(imp.song.bpm!) === 110, { desc, bpm: imp.song.bpm })
+}
+
+// Editor validators: an extreme default key range (満別花丸 ささやき = -33) is clamped with a warning
+const hanamaru = (await api.singers()).flatMap((s) => s.styles.map((st) => ({ s, st }))).find((x) => x.s.name === '満別花丸' && x.st.name === 'ささやき')
+if (hanamaru) {
+  const hs: Song = { bpm: 100, tracks: [{ type: 'sing', singer: hanamaru.st.id, score: 'C4:ら:2' }] }
+  const hr = await renderSong(ctx, hs)
+  const ex = songToVvproj(hs, hr)
+  check('out-of-range key range clamped to -28 with a warning', Object.values(ex.project.song.tracks)[0].keyRangeAdjustment === -28 && ex.warnings.some((w) => w.includes('-33')), ex.warnings)
+}
+const slow: Song = { bpm: 30, tracks: [{ type: 'sing', singer: 3003, score: 'C4:ら:1' }] }
+let reason = ''
+try {
+  songToVvproj(slow, await renderSong(ctx, slow))
+} catch (e) {
+  reason = (e as Error).message
+}
+check('export refuses tempos the editor cannot load (< 40 BPM)', reason.includes('40 BPM'), reason)
+check('exported project passes the editor validators', validateVvproj(project).length === 0, validateVvproj(project))
 
 // .vvproj validates against the editor's own schema (run separately with the editor schema shim)
 // To check against the editor's zod schema, run its projectFileSchema over output/roundtrip.vvproj.
